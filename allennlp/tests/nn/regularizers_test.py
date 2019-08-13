@@ -1,8 +1,9 @@
 # pylint: disable=no-self-use,invalid-name
+import re
 import torch
-from torch.nn.init import constant_
+
 from allennlp.common.params import Params
-from allennlp.nn import InitializerApplicator
+from allennlp.nn import InitializerApplicator, Initializer
 from allennlp.nn.regularizers import L1Regularizer, L2Regularizer, RegularizerApplicator
 from allennlp.common.testing import AllenNlpTestCase
 
@@ -13,7 +14,8 @@ class TestRegularizers(AllenNlpTestCase):
                 torch.nn.Linear(5, 10),
                 torch.nn.Linear(10, 5)
         )
-        initializer = InitializerApplicator([(".*", lambda tensor: constant_(tensor, -1))])
+        constant_init = Initializer.from_params(Params({"type": "constant", "val": -1}))
+        initializer = InitializerApplicator([(".*", constant_init)])
         initializer(model)
         value = RegularizerApplicator([("", L1Regularizer(1.0))])(model)
         # 115 because of biases.
@@ -24,7 +26,8 @@ class TestRegularizers(AllenNlpTestCase):
                 torch.nn.Linear(5, 10),
                 torch.nn.Linear(10, 5)
         )
-        initializer = InitializerApplicator([(".*", lambda tensor: constant_(tensor, 0.5))])
+        constant_init = Initializer.from_params(Params({"type": "constant", "val": 0.5}))
+        initializer = InitializerApplicator([(".*", constant_init)])
         initializer(model)
         value = RegularizerApplicator([("", L2Regularizer(1.0))])(model)
         assert value.data.numpy() == 28.75
@@ -34,7 +37,8 @@ class TestRegularizers(AllenNlpTestCase):
                 torch.nn.Linear(5, 10),
                 torch.nn.Linear(10, 5)
         )
-        initializer = InitializerApplicator([(".*", lambda tensor: constant_(tensor, 1.))])
+        constant_init = Initializer.from_params(Params({"type": "constant", "val": 1.}))
+        initializer = InitializerApplicator([(".*", constant_init)])
         initializer(model)
         value = RegularizerApplicator([("weight", L2Regularizer(0.5)),
                                        ("bias", L1Regularizer(1.0))])(model)
@@ -55,3 +59,19 @@ class TestRegularizers(AllenNlpTestCase):
         assert isinstance(conv, L1Regularizer)
         assert isinstance(linear, L2Regularizer)
         assert linear.alpha == 10
+
+    def test_frozen_params(self):
+        model = torch.nn.Sequential(
+                torch.nn.Linear(5, 10),
+                torch.nn.Linear(10, 5)
+        )
+        constant_init = Initializer.from_params(Params({"type": "constant", "val": -1}))
+        initializer = InitializerApplicator([(".*", constant_init)])
+        initializer(model)
+        # freeze the parameters of the first linear
+        for name, param in model.named_parameters():
+            if re.search(r"0.*$", name):
+                param.requires_grad = False
+        value = RegularizerApplicator([("", L1Regularizer(1.0))])(model)
+        # 55 because of bias (5*10 + 5)
+        assert value.data.numpy() == 55

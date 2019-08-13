@@ -31,3 +31,17 @@ class TestIndexField(AllenNlpTestCase):
 
     def test_printing_doesnt_crash(self):
         print(self.text)
+
+    def test_equality(self):
+        index_field1 = IndexField(4, self.text)
+        index_field2 = IndexField(4, self.text)
+        index_field3 = IndexField(4, TextField([Token(t) for t in ["AllenNLP", "is", "the", "bomb", "!"]],
+                                               {"words": SingleIdTokenIndexer("words")}))
+
+        assert index_field1 == 4
+        assert index_field1 == index_field1
+        assert index_field1 == index_field2
+
+        assert index_field1 != index_field3
+        assert index_field2 != index_field3
+        assert index_field3 == index_field3

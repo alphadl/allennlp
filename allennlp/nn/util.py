@@ -3,15 +3,73 @@ Assorted utilities for working with neural networks in AllenNLP.
 """
 # pylint: disable=too-many-lines
 from collections import defaultdict
-from typing import Dict, List, Optional, Any, Tuple, Callable
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TypeVar, Union
 import logging
-
+import copy
 import math
+import json
+import numpy
+
 import torch
 
 from allennlp.common.checks import ConfigurationError
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+
+T = TypeVar('T')
+
+
+def has_tensor(obj) -> bool:
+    """
+    Given a possibly complex data structure,
+    check if it has any torch.Tensors in it.
+    """
+    if isinstance(obj, torch.Tensor):
+        return True
+    elif isinstance(obj, dict):
+        return any(has_tensor(value) for value in obj.values())
+    elif isinstance(obj, (list, tuple)):
+        return any(has_tensor(item) for item in obj)
+    else:
+        return False
+
+
+def move_to_device(obj, cuda_device: int):
+    """
+    Given a structure (possibly) containing Tensors on the CPU,
+    move all the Tensors to the specified GPU (or do nothing, if they should be on the CPU).
+    """
+    # pylint: disable=too-many-return-statements
+    if cuda_device < 0 or not has_tensor(obj):
+        return obj
+    elif isinstance(obj, torch.Tensor):
+        return obj.cuda(cuda_device)
+    elif isinstance(obj, dict):
+        return {key: move_to_device(value, cuda_device) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [move_to_device(item, cuda_device) for item in obj]
+    elif isinstance(obj, tuple) and hasattr(obj, '_fields'):
+        # This is the best way to detect a NamedTuple, it turns out.
+        return obj.__class__(*[move_to_device(item, cuda_device) for item in obj])
+    elif isinstance(obj, tuple):
+        return tuple([move_to_device(item, cuda_device) for item in obj])
+    else:
+        return obj
+
+
+def clamp_tensor(tensor, minimum, maximum):
+    """
+    Supports sparse and dense tensors.
+    Returns a tensor with values clamped between the provided minimum and maximum,
+    without modifying the original tensor.
+    """
+    if tensor.is_sparse:
+        coalesced_tensor = tensor.coalesce()
+        # pylint: disable=protected-access
+        coalesced_tensor._values().clamp_(minimum, maximum)
+        return coalesced_tensor
+    else:
+        return tensor.clamp(minimum, maximum)
 
 
 def batch_tensor_dicts(tensor_dicts: List[Dict[str, torch.Tensor]],
@@ -98,7 +156,7 @@ def sort_batch_by_length(tensor: torch.Tensor, sequence_lengths: torch.Tensor):
     restoration_indices : torch.LongTensor
         Indices into the sorted_tensor such that
         ``sorted_tensor.index_select(0, restoration_indices) == original_tensor``
-    permuation_index : torch.LongTensor
+    permutation_index : torch.LongTensor
         The indices used to sort the tensor. This is useful if you want to sort many
         tensors using the same ordering.
     """
@@ -109,7 +167,7 @@ def sort_batch_by_length(tensor: torch.Tensor, sequence_lengths: torch.Tensor):
     sorted_sequence_lengths, permutation_index = sequence_lengths.sort(0, descending=True)
     sorted_tensor = tensor.index_select(0, permutation_index)
 
-    index_range = sequence_lengths.new_tensor(torch.arange(0, len(sequence_lengths)))
+    index_range = torch.arange(0, len(sequence_lengths), device=sequence_lengths.device)
     # This is the equivalent of zipping with index, sorting by the original
     # sequence lengths and returning the now sorted indices.
     _, reverse_mapping = permutation_index.sort(0, descending=False)
@@ -131,7 +189,7 @@ def get_final_encoder_states(encoder_outputs: torch.Tensor,
     Additionally, if ``bidirectional`` is ``True``, we will split the final dimension of the
     ``encoder_outputs`` into two and assume that the first half is for the forward direction of the
     encoder and the second half is for the backward direction.  We will concatenate the last state
-    for each encoder dimension, giving ``encoder_outputs[:, -1, :encoding_dim/2]`` concated with
+    for each encoder dimension, giving ``encoder_outputs[:, -1, :encoding_dim/2]`` concatenated with
     ``encoder_outputs[:, 0, encoding_dim/2:]``.
     """
     # These are the indices of the last words in the sequences (i.e. length sans padding - 1).  We
@@ -170,41 +228,63 @@ def get_dropout_mask(dropout_probability: float, tensor_for_masking: torch.Tenso
     This scaling ensures expected values and variances of the output of applying this mask
      and the original tensor are the same.
     """
-    binary_mask = tensor_for_masking.new_tensor(torch.rand(tensor_for_masking.size()) > dropout_probability)
+    binary_mask = (torch.rand(tensor_for_masking.size()) > dropout_probability).to(tensor_for_masking.device)
     # Scale mask by 1/keep_prob to preserve output statistics.
     dropout_mask = binary_mask.float().div(1.0 - dropout_probability)
     return dropout_mask
 
 
-def masked_softmax(vector, mask):
+def masked_softmax(vector: torch.Tensor,
+                   mask: torch.Tensor,
+                   dim: int = -1,
+                   memory_efficient: bool = False,
+                   mask_fill_value: float = -1e32) -> torch.Tensor:
     """
     ``torch.nn.functional.softmax(vector)`` does not work if some elements of ``vector`` should be
     masked.  This performs a softmax on just the non-masked portions of ``vector``.  Passing
     ``None`` in for the mask is also acceptable; you'll just get a regular softmax.
 
-    We assume that both ``vector`` and ``mask`` (if given) have shape ``(batch_size, vector_dim)``.
+    ``vector`` can have an arbitrary number of dimensions; the only requirement is that ``mask`` is
+    broadcastable to ``vector's`` shape.  If ``mask`` has fewer dimensions than ``vector``, we will
+    unsqueeze on dimension 1 until they match.  If you need a different unsqueezing of your mask,
+    do it yourself before passing the mask into this function.
 
-    In the case that the input vector is completely masked, this function returns an array
-    of ``0.0``. This behavior may cause ``NaN`` if this is used as the last layer of a model
-    that uses categorical cross-entropy loss.
+    If ``memory_efficient`` is set to true, we will simply use a very large negative number for those
+    masked positions so that the probabilities of those positions would be approximately 0.
+    This is not accurate in math, but works for most cases and consumes less memory.
+
+    In the case that the input vector is completely masked and ``memory_efficient`` is false, this function
+    returns an array of ``0.0``. This behavior may cause ``NaN`` if this is used as the last layer of
+    a model that uses categorical cross-entropy loss. Instead, if ``memory_efficient`` is true, this function
+    will treat every element as equal, and do softmax over equal numbers.
     """
     if mask is None:
-        result = torch.nn.functional.softmax(vector, dim=-1)
+        result = torch.nn.functional.softmax(vector, dim=dim)
     else:
-        # To limit numerical errors from large vector elements outside the mask, we zero these out.
-        result = torch.nn.functional.softmax(vector * mask, dim=-1)
-        result = result * mask
-        result = result / (result.sum(dim=1, keepdim=True) + 1e-13)
+        mask = mask.float()
+        while mask.dim() < vector.dim():
+            mask = mask.unsqueeze(1)
+        if not memory_efficient:
+            # To limit numerical errors from large vector elements outside the mask, we zero these out.
+            result = torch.nn.functional.softmax(vector * mask, dim=dim)
+            result = result * mask
+            result = result / (result.sum(dim=dim, keepdim=True) + 1e-13)
+        else:
+            masked_vector = vector.masked_fill((1 - mask).byte(), mask_fill_value)
+            result = torch.nn.functional.softmax(masked_vector, dim=dim)
     return result
 
 
-def masked_log_softmax(vector, mask):
+def masked_log_softmax(vector: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """
     ``torch.nn.functional.log_softmax(vector)`` does not work if some elements of ``vector`` should be
     masked.  This performs a log_softmax on just the non-masked portions of ``vector``.  Passing
     ``None`` in for the mask is also acceptable; you'll just get a regular log_softmax.
 
-    We assume that both ``vector`` and ``mask`` (if given) have shape ``(batch_size, vector_dim)``.
+    ``vector`` can have an arbitrary number of dimensions; the only requirement is that ``mask`` is
+    broadcastable to ``vector's`` shape.  If ``mask`` has fewer dimensions than ``vector``, we will
+    unsqueeze on dimension 1 until they match.  If you need a different unsqueezing of your mask,
+    do it yourself before passing the mask into this function.
 
     In the case that the input vector is completely masked, the return value of this function is
     arbitrary, but not ``nan``.  You should be masking the result of whatever computation comes out
@@ -217,18 +297,112 @@ def masked_log_softmax(vector, mask):
     extreme, you've got bigger problems than this.
     """
     if mask is not None:
+        mask = mask.float()
+        while mask.dim() < vector.dim():
+            mask = mask.unsqueeze(1)
         # vector + mask.log() is an easy way to zero out masked elements in logspace, but it
         # results in nans when the whole vector is masked.  We need a very small value instead of a
         # zero in the mask for these cases.  log(1 + 1e-45) is still basically 0, so we can safely
         # just add 1e-45 before calling mask.log().  We use 1e-45 because 1e-46 is so small it
         # becomes 0 - this is just the smallest value we can actually use.
         vector = vector + (mask + 1e-45).log()
-    return torch.nn.functional.log_softmax(vector, dim=1)
+    return torch.nn.functional.log_softmax(vector, dim=dim)
+
+
+def masked_max(vector: torch.Tensor,
+               mask: torch.Tensor,
+               dim: int,
+               keepdim: bool = False,
+               min_val: float = -1e7) -> torch.Tensor:
+    """
+    To calculate max along certain dimensions on masked values
+
+    Parameters
+    ----------
+    vector : ``torch.Tensor``
+        The vector to calculate max, assume unmasked parts are already zeros
+    mask : ``torch.Tensor``
+        The mask of the vector. It must be broadcastable with vector.
+    dim : ``int``
+        The dimension to calculate max
+    keepdim : ``bool``
+        Whether to keep dimension
+    min_val : ``float``
+        The minimal value for paddings
+
+    Returns
+    -------
+    A ``torch.Tensor`` of including the maximum values.
+    """
+    one_minus_mask = (1.0 - mask).byte()
+    replaced_vector = vector.masked_fill(one_minus_mask, min_val)
+    max_value, _ = replaced_vector.max(dim=dim, keepdim=keepdim)
+    return max_value
+
+
+def masked_mean(vector: torch.Tensor,
+                mask: torch.Tensor,
+                dim: int,
+                keepdim: bool = False,
+                eps: float = 1e-8) -> torch.Tensor:
+    """
+    To calculate mean along certain dimensions on masked values
+
+    Parameters
+    ----------
+    vector : ``torch.Tensor``
+        The vector to calculate mean.
+    mask : ``torch.Tensor``
+        The mask of the vector. It must be broadcastable with vector.
+    dim : ``int``
+        The dimension to calculate mean
+    keepdim : ``bool``
+        Whether to keep dimension
+    eps : ``float``
+        A small value to avoid zero division problem.
+
+    Returns
+    -------
+    A ``torch.Tensor`` of including the mean values.
+    """
+    one_minus_mask = (1.0 - mask).byte()
+    replaced_vector = vector.masked_fill(one_minus_mask, 0.0)
+
+    value_sum = torch.sum(replaced_vector, dim=dim, keepdim=keepdim)
+    value_count = torch.sum(mask.float(), dim=dim, keepdim=keepdim)
+    return value_sum / value_count.clamp(min=eps)
+
+
+def masked_flip(padded_sequence: torch.Tensor,
+                sequence_lengths: List[int]) -> torch.Tensor:
+    """
+        Flips a padded tensor along the time dimension without affecting masked entries.
+
+        Parameters
+        ----------
+        padded_sequence : ``torch.Tensor``
+            The tensor to flip along the time dimension.
+            Assumed to be of dimensions (batch size, num timesteps, ...)
+        sequence_lengths : ``torch.Tensor``
+            A list containing the lengths of each unpadded sequence in the batch.
+
+        Returns
+        -------
+        A ``torch.Tensor`` of the same shape as padded_sequence.
+        """
+    assert padded_sequence.size(0) == len(sequence_lengths), \
+        f'sequence_lengths length ${len(sequence_lengths)} does not match batch size ${padded_sequence.size(0)}'
+    num_timesteps = padded_sequence.size(1)
+    flipped_padded_sequence = torch.flip(padded_sequence, [1])
+    sequences = [flipped_padded_sequence[i, num_timesteps - length:] for i, length in enumerate(sequence_lengths)]
+    return torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True)
 
 
 def viterbi_decode(tag_sequence: torch.Tensor,
                    transition_matrix: torch.Tensor,
-                   tag_observations: Optional[List[int]] = None):
+                   tag_observations: Optional[List[int]] = None,
+                   allowed_start_transitions: torch.Tensor = None,
+                   allowed_end_transitions: torch.Tensor = None):
     """
     Perform Viterbi decoding in log space over a sequence given a transition matrix
     specifying pairwise (transition) potentials between tags and a matrix of shape
@@ -246,11 +420,19 @@ def viterbi_decode(tag_sequence: torch.Tensor,
     tag_observations : Optional[List[int]], optional, (default = None)
         A list of length ``sequence_length`` containing the class ids of observed
         elements in the sequence, with unobserved elements being set to -1. Note that
-        it is possible to provide evidence which results in degenerate labellings if
+        it is possible to provide evidence which results in degenerate labelings if
         the sequences of tags you provide as evidence cannot transition between each
         other, or those transitions are extremely unlikely. In this situation we log a
         warning, but the responsibility for providing self-consistent evidence ultimately
         lies with the user.
+    allowed_start_transitions : torch.Tensor, optional, (default = None)
+        An optional tensor of shape (num_tags,) describing which tags the START token
+        may transition *to*. If provided, additional transition constraints will be used for
+        determining the start element of the sequence.
+    allowed_end_transitions : torch.Tensor, optional, (default = None)
+        An optional tensor of shape (num_tags,) describing which tags may transition *to* the
+        end tag. If provided, additional transition constraints will be used for determining
+        the end element of the sequence.
 
     Returns
     -------
@@ -260,6 +442,37 @@ def viterbi_decode(tag_sequence: torch.Tensor,
         The score of the viterbi path.
     """
     sequence_length, num_tags = list(tag_sequence.size())
+
+    has_start_end_restrictions = allowed_end_transitions is not None or allowed_start_transitions is not None
+
+    if has_start_end_restrictions:
+
+        if allowed_end_transitions is None:
+            allowed_end_transitions = torch.zeros(num_tags)
+        if allowed_start_transitions is None:
+            allowed_start_transitions = torch.zeros(num_tags)
+
+        num_tags = num_tags + 2
+        new_transition_matrix = torch.zeros(num_tags, num_tags)
+        new_transition_matrix[:-2, :-2] = transition_matrix
+
+        # Start and end transitions are fully defined, but cannot transition between each other.
+        # pylint: disable=not-callable
+        allowed_start_transitions = torch.cat([allowed_start_transitions, torch.tensor([-math.inf, -math.inf])])
+        allowed_end_transitions = torch.cat([allowed_end_transitions, torch.tensor([-math.inf, -math.inf])])
+        # pylint: enable=not-callable
+
+        # First define how we may transition FROM the start and end tags.
+        new_transition_matrix[-2, :] = allowed_start_transitions
+        # We cannot transition from the end tag to any tag.
+        new_transition_matrix[-1, :] = -math.inf
+
+        new_transition_matrix[:, -1] = allowed_end_transitions
+        # We cannot transition to the start tag from any tag.
+        new_transition_matrix[:, -2] = -math.inf
+
+        transition_matrix = new_transition_matrix
+
     if tag_observations:
         if len(tag_observations) != sequence_length:
             raise ConfigurationError("Observations were provided, but they were not the same length "
@@ -267,6 +480,15 @@ def viterbi_decode(tag_sequence: torch.Tensor,
                                      .format(sequence_length, tag_observations))
     else:
         tag_observations = [-1 for _ in range(sequence_length)]
+
+
+    if has_start_end_restrictions:
+        tag_observations = [num_tags - 2] + tag_observations + [num_tags - 1]
+        zero_sentinel = torch.zeros(1, num_tags)
+        extra_tags_sentinel = torch.ones(sequence_length, 2) * -math.inf
+        tag_sequence = torch.cat([tag_sequence, extra_tags_sentinel], -1)
+        tag_sequence = torch.cat([zero_sentinel, tag_sequence, zero_sentinel], 0)
+        sequence_length = tag_sequence.size(0)
 
     path_scores = []
     path_indices = []
@@ -289,7 +511,7 @@ def viterbi_decode(tag_sequence: torch.Tensor,
         observation = tag_observations[timestep]
         # Warn the user if they have passed
         # invalid/extremely unlikely evidence.
-        if tag_observations[timestep - 1] != -1:
+        if tag_observations[timestep - 1] != -1 and observation != -1:
             if transition_matrix[tag_observations[timestep - 1], observation] < -10000:
                 logger.warning("The pairwise potential between tags you have passed as "
                                "observations is extremely unlikely. Double check your evidence "
@@ -309,6 +531,9 @@ def viterbi_decode(tag_sequence: torch.Tensor,
         viterbi_path.append(int(backward_timestep[viterbi_path[-1]]))
     # Reverse the backward path.
     viterbi_path.reverse()
+
+    if has_start_end_restrictions:
+        viterbi_path = viterbi_path[1:-1]
     return viterbi_path, viterbi_score
 
 
@@ -360,44 +585,6 @@ def get_text_field_mask(text_field_tensors: Dict[str, torch.Tensor],
     else:
         raise ValueError("Expected a tensor with dimension 2 or 3, found {}".format(smallest_dim))
 
-def _last_dimension_applicator(function_to_apply: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
-                               tensor: torch.Tensor,
-                               mask: Optional[torch.Tensor] = None):
-    """
-    Takes a tensor with 3 or more dimensions and applies a function over the last dimension.  We
-    assume the tensor has shape ``(batch_size, ..., sequence_length)`` and that the mask (if given)
-    has shape ``(batch_size, sequence_length)``.  We first unsqueeze and expand the mask so that it
-    has the same shape as the tensor, then flatten them both to be 2D, pass them through
-    the function and put the tensor back in its original shape.
-    """
-    tensor_shape = tensor.size()
-    reshaped_tensor = tensor.view(-1, tensor.size()[-1])
-    if mask is not None:
-        while mask.dim() < tensor.dim():
-            mask = mask.unsqueeze(1)
-        mask = mask.expand_as(tensor).contiguous().float()
-        mask = mask.view(-1, mask.size()[-1])
-    reshaped_result = function_to_apply(reshaped_tensor, mask)
-    return reshaped_result.view(*tensor_shape)
-
-
-def last_dim_softmax(tensor: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """
-    Takes a tensor with 3 or more dimensions and does a masked softmax over the last dimension.  We
-    assume the tensor has shape ``(batch_size, ..., sequence_length)`` and that the mask (if given)
-    has shape ``(batch_size, sequence_length)``.
-    """
-    return _last_dimension_applicator(masked_softmax, tensor, mask)
-
-
-def last_dim_log_softmax(tensor: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """
-    Takes a tensor with 3 or more dimensions and does a masked log softmax over the last dimension.
-    We assume the tensor has shape ``(batch_size, ..., sequence_length)`` and that the mask (if given)
-    has shape ``(batch_size, sequence_length)``.
-    """
-    return _last_dimension_applicator(masked_log_softmax, tensor, mask)
-
 
 def weighted_sum(matrix: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
     """
@@ -441,8 +628,11 @@ def weighted_sum(matrix: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
 def sequence_cross_entropy_with_logits(logits: torch.FloatTensor,
                                        targets: torch.LongTensor,
                                        weights: torch.FloatTensor,
-                                       batch_average: bool = True,
-                                       label_smoothing: float = None) -> torch.FloatTensor:
+                                       average: str = "batch",
+                                       label_smoothing: float = None,
+                                       gamma: float = None,
+                                       alpha: Union[float, List[float], torch.FloatTensor] = None
+                                      ) -> torch.FloatTensor:
     """
     Computes the cross entropy loss of a sequence, weighted with respect to
     some user provided weights. Note that the weighting here is not the same as
@@ -460,28 +650,88 @@ def sequence_cross_entropy_with_logits(logits: torch.FloatTensor,
         index of the true class for each corresponding step.
     weights : ``torch.FloatTensor``, required.
         A ``torch.FloatTensor`` of size (batch, sequence_length)
-    batch_average : bool, optional, (default = True).
-        A bool indicating whether the loss should be averaged across the batch,
-        or returned as a vector of losses per batch element.
+    average: str, optional (default = "batch")
+        If "batch", average the loss across the batches. If "token", average
+        the loss across each item in the input. If ``None``, return a vector
+        of losses per batch element.
     label_smoothing : ``float``, optional (default = None)
         Whether or not to apply label smoothing to the cross-entropy loss.
-        For example, with a label smoothing value of 0.2, a 4 class classifcation
+        For example, with a label smoothing value of 0.2, a 4 class classification
         target would look like ``[0.05, 0.05, 0.85, 0.05]`` if the 3rd class was
         the correct label.
+    gamma : ``float``, optional (default = None)
+        Focal loss[*] focusing parameter ``gamma`` to reduces the relative loss for
+        well-classified examples and put more focus on hard. The greater value
+        ``gamma`` is, the more focus on hard examples.
+    alpha : ``float`` or ``List[float]``, optional (default = None)
+        Focal loss[*] weighting factor ``alpha`` to balance between classes. Can be
+        used independently with ``gamma``. If a single ``float`` is provided, it
+        is assumed binary case using ``alpha`` and ``1 - alpha`` for positive and
+        negative respectively. If a list of ``float`` is provided, with the same
+        length as the number of classes, the weights will match the classes.
+        [*] T. Lin, P. Goyal, R. Girshick, K. He and P. Dollár, "Focal Loss for
+        Dense Object Detection," 2017 IEEE International Conference on Computer
+        Vision (ICCV), Venice, 2017, pp. 2999-3007.
 
     Returns
     -------
     A torch.FloatTensor representing the cross entropy loss.
-    If ``batch_average == True``, the returned loss is a scalar.
-    If ``batch_average == False``, the returned loss is a vector of shape (batch_size,).
+    If ``average=="batch"`` or ``average=="token"``, the returned loss is a scalar.
+    If ``average is None``, the returned loss is a vector of shape (batch_size,).
 
     """
+    if average not in {None, "token", "batch"}:
+        raise ValueError("Got average f{average}, expected one of "
+                         "None, 'token', or 'batch'")
+
+    # make sure weights are float
+    weights = weights.float()
+    # sum all dim except batch
+    non_batch_dims = tuple(range(1, len(weights.shape)))
+    # shape : (batch_size,)
+    weights_batch_sum = weights.sum(dim=non_batch_dims)
     # shape : (batch * sequence_length, num_classes)
     logits_flat = logits.view(-1, logits.size(-1))
     # shape : (batch * sequence_length, num_classes)
     log_probs_flat = torch.nn.functional.log_softmax(logits_flat, dim=-1)
     # shape : (batch * max_len, 1)
     targets_flat = targets.view(-1, 1).long()
+    # focal loss coefficient
+    if gamma:
+        # shape : (batch * sequence_length, num_classes)
+        probs_flat = log_probs_flat.exp()
+        # shape : (batch * sequence_length,)
+        probs_flat = torch.gather(probs_flat, dim=1, index=targets_flat)
+        # shape : (batch * sequence_length,)
+        focal_factor = (1. - probs_flat) ** gamma
+        # shape : (batch, sequence_length)
+        focal_factor = focal_factor.view(*targets.size())
+        weights = weights * focal_factor
+
+    if alpha is not None:
+        # shape : () / (num_classes,)
+        if isinstance(alpha, (float, int)):
+            # pylint: disable=not-callable
+            # shape : (2,)
+            alpha_factor = torch.tensor([1. - float(alpha), float(alpha)],
+                                        dtype=weights.dtype, device=weights.device)
+            # pylint: enable=not-callable
+        elif isinstance(alpha, (list, numpy.ndarray, torch.Tensor)):
+            # pylint: disable=not-callable
+            # shape : (c,)
+            alpha_factor = torch.tensor(alpha, dtype=weights.dtype, device=weights.device)
+            # pylint: enable=not-callable
+            if not alpha_factor.size():
+                # shape : (1,)
+                alpha_factor = alpha_factor.view(1)
+                # shape : (2,)
+                alpha_factor = torch.cat([1 - alpha_factor, alpha_factor])
+        else:
+            raise TypeError(('alpha must be float, list of float, or torch.FloatTensor, '
+                             '{} provided.').format(type(alpha)))
+        # shape : (batch, max_len)
+        alpha_factor = torch.gather(alpha_factor, dim=0, index=targets_flat.view(-1)).view(*targets.size())
+        weights = weights * alpha_factor
 
     if label_smoothing is not None and label_smoothing > 0.0:
         num_classes = logits.size(-1)
@@ -500,14 +750,19 @@ def sequence_cross_entropy_with_logits(logits: torch.FloatTensor,
     # shape : (batch, sequence_length)
     negative_log_likelihood = negative_log_likelihood_flat.view(*targets.size())
     # shape : (batch, sequence_length)
-    negative_log_likelihood = negative_log_likelihood * weights.float()
-    # shape : (batch_size,)
-    per_batch_loss = negative_log_likelihood.sum(1) / (weights.sum(1).float() + 1e-13)
+    negative_log_likelihood = negative_log_likelihood * weights
 
-    if batch_average:
-        num_non_empty_sequences = ((weights.sum(1) > 0).float().sum() + 1e-13)
+    if average == "batch":
+        # shape : (batch_size,)
+        per_batch_loss = negative_log_likelihood.sum(non_batch_dims) / (weights_batch_sum + 1e-13)
+        num_non_empty_sequences = ((weights_batch_sum > 0).float().sum() + 1e-13)
         return per_batch_loss.sum() / num_non_empty_sequences
-    return per_batch_loss
+    elif average == "token":
+        return negative_log_likelihood.sum() / (weights_batch_sum.sum() + 1e-13)
+    else:
+        # shape : (batch_size,)
+        per_batch_loss = negative_log_likelihood.sum(non_batch_dims) / (weights_batch_sum + 1e-13)
+        return per_batch_loss
 
 
 def replace_masked_values(tensor: torch.Tensor, mask: torch.Tensor, replace_with: float) -> torch.Tensor:
@@ -515,14 +770,50 @@ def replace_masked_values(tensor: torch.Tensor, mask: torch.Tensor, replace_with
     Replaces all masked values in ``tensor`` with ``replace_with``.  ``mask`` must be broadcastable
     to the same shape as ``tensor``. We require that ``tensor.dim() == mask.dim()``, as otherwise we
     won't know which dimensions of the mask to unsqueeze.
+
+    This just does ``tensor.masked_fill()``, except the pytorch method fills in things with a mask
+    value of 1, where we want the opposite.  You can do this in your own code with
+    ``tensor.masked_fill((1 - mask).byte(), replace_with)``.
     """
-    # We'll build a tensor of the same shape as `tensor`, zero out masked values, then add back in
-    # the `replace_with` value.
     if tensor.dim() != mask.dim():
         raise ConfigurationError("tensor.dim() (%d) != mask.dim() (%d)" % (tensor.dim(), mask.dim()))
-    one_minus_mask = 1.0 - mask
-    values_to_add = replace_with * one_minus_mask
-    return tensor * mask + values_to_add
+    return tensor.masked_fill((1 - mask).byte(), replace_with)
+
+
+def tensors_equal(tensor1: torch.Tensor, tensor2: torch.Tensor, tolerance: float = 1e-12) -> bool:
+    """
+    A check for tensor equality (by value).  We make sure that the tensors have the same shape,
+    then check all of the entries in the tensor for equality.  We additionally allow the input
+    tensors to be lists or dictionaries, where we then do the above check on every position in the
+    list / item in the dictionary.  If we find objects that aren't tensors as we're doing that, we
+    just defer to their equality check.
+
+    This is kind of a catch-all method that's designed to make implementing ``__eq__`` methods
+    easier, in a way that's really only intended to be useful for tests.
+    """
+    # pylint: disable=too-many-return-statements
+    if isinstance(tensor1, (list, tuple)):
+        if not isinstance(tensor2, (list, tuple)) or len(tensor1) != len(tensor2):
+            return False
+        return all([tensors_equal(t1, t2, tolerance) for t1, t2 in zip(tensor1, tensor2)])
+    elif isinstance(tensor1, dict):
+        if not isinstance(tensor2, dict):
+            return False
+        if tensor1.keys() != tensor2.keys():
+            return False
+        return all([tensors_equal(tensor1[key], tensor2[key], tolerance) for key in tensor1])
+    elif isinstance(tensor1, torch.Tensor):
+        if not isinstance(tensor2, torch.Tensor):
+            return False
+        if tensor1.size() != tensor2.size():
+            return False
+        return ((tensor1 - tensor2).abs().float() < tolerance).all()
+    else:
+        try:
+            return tensor1 == tensor2
+        except RuntimeError:
+            print(type(tensor1), type(tensor2))
+            raise
 
 
 def device_mapping(cuda_device: int):
@@ -531,11 +822,13 @@ def device_mapping(cuda_device: int):
     you have to supply a `map_location` function. Call this with
     the desired `cuda_device` to get the function that `torch.load()` needs.
     """
+
     def inner_device_mapping(storage: torch.Storage, location) -> torch.Storage:  # pylint: disable=unused-argument
         if cuda_device >= 0:
             return storage.cuda(cuda_device)
         else:
             return storage
+
     return inner_device_mapping
 
 
@@ -570,6 +863,27 @@ def combine_tensors(combination: str, tensors: List[torch.Tensor]) -> torch.Tens
     return torch.cat(to_concatenate, dim=-1)
 
 
+def _rindex(sequence: Sequence[T], obj: T) -> int:
+    """
+    Return zero-based index in the sequence of the last item whose value is equal to obj.  Raises a
+    ValueError if there is no such item.
+
+    Parameters
+    ----------
+    sequence : ``Sequence[T]``
+    obj : ``T``
+
+    Returns
+    -------
+    zero-based index associated to the position of the last item equal to obj
+    """
+    for i in range(len(sequence) - 1, -1, -1):
+        if sequence[i] == obj:
+            return i
+
+    raise ValueError(f"Unable to find {obj} in sequence {sequence}.")
+
+
 def _get_combination(combination: str, tensors: List[torch.Tensor]) -> torch.Tensor:
     if combination.isdigit():
         index = int(combination) - 1
@@ -588,6 +902,96 @@ def _get_combination(combination: str, tensors: List[torch.Tensor]) -> torch.Ten
             return first_tensor + second_tensor
         elif operation == '-':
             return first_tensor - second_tensor
+        else:
+            raise ConfigurationError("Invalid operation: " + operation)
+
+
+def combine_tensors_and_multiply(combination: str,
+                                 tensors: List[torch.Tensor],
+                                 weights: torch.nn.Parameter) -> torch.Tensor:
+    """
+    Like :func:`combine_tensors`, but does a weighted (linear) multiplication while combining.
+    This is a separate function from ``combine_tensors`` because we try to avoid instantiating
+    large intermediate tensors during the combination, which is possible because we know that we're
+    going to be multiplying by a weight vector in the end.
+
+    Parameters
+    ----------
+    combination : ``str``
+        Same as in :func:`combine_tensors`
+    tensors : ``List[torch.Tensor]``
+        A list of tensors to combine, where the integers in the ``combination`` are (1-indexed)
+        positions in this list of tensors.  These tensors are all expected to have either three or
+        four dimensions, with the final dimension being an embedding.  If there are four
+        dimensions, one of them must have length 1.
+    weights : ``torch.nn.Parameter``
+        A vector of weights to use for the combinations.  This should have shape (combined_dim,),
+        as calculated by :func:`get_combined_dim`.
+    """
+    if len(tensors) > 9:
+        raise ConfigurationError("Double-digit tensor lists not currently supported")
+    combination = combination.replace('x', '1').replace('y', '2')
+    pieces = combination.split(',')
+    tensor_dims = [tensor.size(-1) for tensor in tensors]
+    combination_dims = [_get_combination_dim(piece, tensor_dims) for piece in pieces]
+    dims_so_far = 0
+    to_sum = []
+    for piece, combination_dim in zip(pieces, combination_dims):
+        weight = weights[dims_so_far:(dims_so_far + combination_dim)]
+        dims_so_far += combination_dim
+        to_sum.append(_get_combination_and_multiply(piece, tensors, weight))
+    result = to_sum[0]
+    for result_piece in to_sum[1:]:
+        result = result + result_piece
+    return result
+
+
+def _get_combination_and_multiply(combination: str,
+                                  tensors: List[torch.Tensor],
+                                  weight: torch.nn.Parameter) -> torch.Tensor:
+    if combination.isdigit():
+        index = int(combination) - 1
+        return torch.matmul(tensors[index], weight)
+    else:
+        if len(combination) != 3:
+            raise ConfigurationError("Invalid combination: " + combination)
+        first_tensor = _get_combination(combination[0], tensors)
+        second_tensor = _get_combination(combination[2], tensors)
+        operation = combination[1]
+        if operation == '*':
+            if first_tensor.dim() > 4 or second_tensor.dim() > 4:
+                raise ValueError("Tensors with dim > 4 not currently supported")
+            desired_dim = max(first_tensor.dim(), second_tensor.dim()) - 1
+            if first_tensor.dim() == 4:
+                expanded_dim = _rindex(first_tensor.size(), 1)
+                first_tensor = first_tensor.squeeze(expanded_dim)
+            if second_tensor.dim() == 4:
+                expanded_dim = _rindex(second_tensor.size(), 1)
+                second_tensor = second_tensor.squeeze(expanded_dim)
+            intermediate = first_tensor * weight
+            result = torch.matmul(intermediate, second_tensor.transpose(-1, -2))
+            if result.dim() == desired_dim + 1:
+                result = result.squeeze(-1)
+            return result
+        elif operation == '/':
+            if first_tensor.dim() > 4 or second_tensor.dim() > 4:
+                raise ValueError("Tensors with dim > 4 not currently supported")
+            desired_dim = max(first_tensor.dim(), second_tensor.dim()) - 1
+            if first_tensor.dim() == 4:
+                expanded_dim = _rindex(first_tensor.size(), 1)
+                first_tensor = first_tensor.squeeze(expanded_dim)
+            if second_tensor.dim() == 4:
+                expanded_dim = _rindex(second_tensor.size(), 1)
+                second_tensor = second_tensor.squeeze(expanded_dim)
+            intermediate = first_tensor * weight
+            result = torch.matmul(intermediate, second_tensor.pow(-1).transpose(-1, -2))
+            if result.dim() == desired_dim + 1:
+                result = result.squeeze(-1)
+            return result
+        elif operation == '+':
+            return torch.matmul(first_tensor, weight) + torch.matmul(second_tensor, weight)
+        elif operation == '-':
+            return torch.matmul(first_tensor, weight) - torch.matmul(second_tensor, weight)
         else:
             raise ConfigurationError("Invalid operation: " + operation)
 
@@ -653,6 +1057,7 @@ def logsumexp(tensor: torch.Tensor,
         stable_vec = tensor - max_score.unsqueeze(dim)
     return max_score + (stable_vec.exp().sum(dim, keepdim=keepdim)).log()
 
+
 def get_device_of(tensor: torch.Tensor) -> int:
     """
     Returns the device of the tensor.
@@ -661,6 +1066,7 @@ def get_device_of(tensor: torch.Tensor) -> int:
         return -1
     else:
         return tensor.get_device()
+
 
 def flatten_and_batch_shift_indices(indices: torch.Tensor,
                                     sequence_length: int) -> torch.Tensor:
@@ -694,6 +1100,8 @@ def flatten_and_batch_shift_indices(indices: torch.Tensor,
     offset_indices : ``torch.LongTensor``
     """
     # Shape: (batch_size)
+    if torch.max(indices) >= sequence_length or torch.min(indices) < 0:
+        raise ConfigurationError(f"All elements in indices should be in range (0, {sequence_length - 1})")
     offsets = get_range_vector(indices.size(0), get_device_of(indices)) * sequence_length
     for _ in range(len(indices.size()) - 1):
         offsets = offsets.unsqueeze(1)
@@ -832,7 +1240,7 @@ def bucket_values(distances: torch.Tensor,
     # We do this to make the buckets more granular in the initial range, where we expect
     # most values to fall. We then add (num_identity_buckets - 1) because we want these indices
     # to start _after_ the fixed number of buckets which we specified would only hold single values.
-    logspace_index = (distances.float().log()/math.log(2)).floor().long() + (num_identity_buckets - 1)
+    logspace_index = (distances.float().log() / math.log(2)).floor().long() + (num_identity_buckets - 1)
     # create a mask for values which will go into single number buckets (i.e not a range).
     use_identity_mask = (distances <= num_identity_buckets).long()
     use_buckets_mask = 1 + (-1 * use_identity_mask)
@@ -841,6 +1249,7 @@ def bucket_values(distances: torch.Tensor,
     combined_index = use_identity_mask * distances + use_buckets_mask * logspace_index
     # Clamp to put anything > num_total_buckets into the final bucket.
     return combined_index.clamp(0, num_total_buckets - 1)
+
 
 def add_sentence_boundary_token_ids(tensor: torch.Tensor,
                                     mask: torch.Tensor,
@@ -897,6 +1306,7 @@ def add_sentence_boundary_token_ids(tensor: torch.Tensor,
         raise ValueError("add_sentence_boundary_token_ids only accepts 2D and 3D input")
 
     return tensor_with_boundary_tokens, new_mask
+
 
 def remove_sentence_boundaries(tensor: torch.Tensor,
                                mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -993,3 +1403,72 @@ def add_positional_features(tensor: torch.Tensor,
         # to add a row of zeros to make up the difference.
         sinusoids = torch.cat([sinusoids, sinusoids.new_zeros(timesteps, 1)], 1)
     return tensor + sinusoids.unsqueeze(0)
+
+
+def clone(module: torch.nn.Module, num_copies: int) -> torch.nn.ModuleList:
+    """Produce N identical layers."""
+    return torch.nn.ModuleList([copy.deepcopy(module) for _ in range(num_copies)])
+
+
+def combine_initial_dims(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Given a (possibly higher order) tensor of ids with shape
+    (d1, ..., dn, sequence_length)
+    Return a view that's (d1 * ... * dn, sequence_length).
+    If original tensor is 1-d or 2-d, return it as is.
+    """
+    if tensor.dim() <= 2:
+        return tensor
+    else:
+        return tensor.view(-1, tensor.size(-1))
+
+
+def uncombine_initial_dims(tensor: torch.Tensor, original_size: torch.Size) -> torch.Tensor:
+    """
+    Given a tensor of embeddings with shape
+    (d1 * ... * dn, sequence_length, embedding_dim)
+    and the original shape
+    (d1, ..., dn, sequence_length),
+    return the reshaped tensor of embeddings with shape
+    (d1, ..., dn, sequence_length, embedding_dim).
+    If original size is 1-d or 2-d, return it as is.
+    """
+    if len(original_size) <= 2:
+        return tensor
+    else:
+        view_args = list(original_size) + [tensor.size(-1)]
+        return tensor.view(*view_args)
+
+
+def inspect_parameters(module: torch.nn.Module, quiet: bool = False) -> Dict[str, Any]:
+    """
+    Inspects the model/module parameters and their tunability. The output is structured
+    in a nested dict so that parameters in same sub-modules are grouped together.
+    This can be helpful to setup module path based regex, for example in initializer.
+    It prints it by default (optional) and returns the inspection dict. Eg. output::
+
+        {
+            "_text_field_embedder": {
+                "token_embedder_tokens": {
+                    "_projection": {
+                        "bias": "tunable",
+                        "weight": "tunable"
+                    },
+                    "weight": "frozen"
+                }
+            }
+        }
+
+    """
+    results: Dict[str, Any] = {}
+    for name, param in sorted(module.named_parameters()):
+        keys = name.split(".")
+        write_to = results
+        for key in keys[:-1]:
+            if key not in write_to:
+                write_to[key] = {}
+            write_to = write_to[key]
+        write_to[keys[-1]] = "tunable" if param.requires_grad else "frozen"
+    if not quiet:
+        print(json.dumps(results, indent=4))
+    return results

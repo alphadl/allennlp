@@ -13,7 +13,7 @@ from allennlp.modules.span_extractors.span_extractor import SpanExtractor
 from allennlp.models.model import Model
 from allennlp.nn import InitializerApplicator, RegularizerApplicator
 from allennlp.nn.util import get_text_field_mask, sequence_cross_entropy_with_logits
-from allennlp.nn.util import last_dim_softmax, get_lengths_from_binary_sequence_mask
+from allennlp.nn.util import masked_softmax, get_lengths_from_binary_sequence_mask
 from allennlp.training.metrics import CategoricalAccuracy
 from allennlp.training.metrics import EvalbBracketingScorer, DEFAULT_EVALB_DIR
 from allennlp.common.checks import ConfigurationError
@@ -210,7 +210,7 @@ class SpanConstituencyParser(Model):
             span_representations = self.feedforward_layer(span_representations)
 
         logits = self.tag_projection_layer(span_representations)
-        class_probabilities = last_dim_softmax(logits, span_mask.unsqueeze(-1))
+        class_probabilities = masked_softmax(logits, span_mask.unsqueeze(-1))
 
         output_dict = {
                 "class_probabilities": class_probabilities,
@@ -354,14 +354,14 @@ class SpanConstituencyParser(Model):
             A list of spans, where each span is a ``namedtuple`` containing the
             following attributes:
 
-        start : ``int``
-            The start index of the span.
-        end : ``int``
-            The exclusive end index of the span.
-        no_label_prob : ``float``
-            The probability of this span being assigned the ``NO-LABEL`` label.
-        label_prob : ``float``
-            The probability of the most likely label.
+            start : ``int``
+                The start index of the span.
+            end : ``int``
+                The exclusive end index of the span.
+            no_label_prob : ``float``
+                The probability of this span being assigned the ``NO-LABEL`` label.
+            label_prob : ``float``
+                The probability of the most likely label.
 
         Returns
         -------

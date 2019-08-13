@@ -64,13 +64,12 @@ class Batch(Iterable):
                 all_field_lengths[field_name].append(instance_field_lengths)
         for field_name, field_lengths in all_field_lengths.items():
             for padding_key in field_lengths[0].keys():
-                max_value = max(x[padding_key] if padding_key in x else 0 for x in field_lengths)
+                max_value = max(x.get(padding_key, 0) for x in field_lengths)
                 padding_lengths[field_name][padding_key] = max_value
         return {**padding_lengths}
 
     def as_tensor_dict(self,
                        padding_lengths: Dict[str, Dict[str, int]] = None,
-                       cuda_device: int = -1,
                        verbose: bool = False) -> Dict[str, Union[torch.Tensor, Dict[str, torch.Tensor]]]:
         # This complex return type is actually predefined elsewhere as a DataArray,
         # but we can't use it because mypy doesn't like it.
@@ -90,9 +89,6 @@ class Batch(Iterable):
 
             Entries in this dictionary are keyed first by field name (e.g., "question"), then by
             padding key (e.g., "num_tokens").
-        cuda_device : ``int``
-            If cuda_device >= 0, GPUs are available and Pytorch was compiled with CUDA support, the
-            tensor will be copied to the cuda_device specified.
         verbose : ``bool``, optional (default=``False``)
             Should we output logging information when we're doing this padding?  If the batch is
             large, this is nice to have, because padding a large batch could take a long time.
@@ -128,7 +124,7 @@ class Batch(Iterable):
         lengths_to_use: Dict[str, Dict[str, int]] = defaultdict(dict)
         for field_name, instance_field_lengths in instance_padding_lengths.items():
             for padding_key in instance_field_lengths.keys():
-                if padding_lengths[field_name].get(padding_key) is not None:
+                if padding_key in padding_lengths[field_name]:
                     lengths_to_use[field_name][padding_key] = padding_lengths[field_name][padding_key]
                 else:
                     lengths_to_use[field_name][padding_key] = instance_field_lengths[padding_key]
@@ -138,7 +134,7 @@ class Batch(Iterable):
         if verbose:
             logger.info("Now actually padding instances to length: %s", str(lengths_to_use))
         for instance in self.instances:
-            for field, tensors in instance.as_tensor_dict(lengths_to_use, cuda_device).items():
+            for field, tensors in instance.as_tensor_dict(lengths_to_use).items():
                 field_tensors[field].append(tensors)
 
         # Finally, we combine the tensors that we got for each instance into one big tensor (or set

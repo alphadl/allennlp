@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any, List
 import logging
 import copy
 
@@ -16,8 +16,8 @@ from allennlp.modules import FeedForward
 from allennlp.models.model import Model
 from allennlp.nn import InitializerApplicator, RegularizerApplicator, Activation
 from allennlp.nn.util import get_text_field_mask, get_range_vector
-from allennlp.nn.util import get_device_of, last_dim_log_softmax, get_lengths_from_binary_sequence_mask
-from allennlp.nn.decoding.chu_liu_edmonds import decode_mst
+from allennlp.nn.util import get_device_of, masked_log_softmax, get_lengths_from_binary_sequence_mask
+from allennlp.nn.chu_liu_edmonds import decode_mst
 from allennlp.training.metrics import AttachmentScores
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
@@ -35,7 +35,7 @@ class BiaffineDependencyParser(Model):
     followed by separate biaffine classifiers for pairs of words,
     predicting whether a directed arc exists between the two words
     and the dependency label the arc should have. Decoding can either
-    be done greedily, or the optimial Minimum Spanning Tree can be
+    be done greedily, or the optimal Minimum Spanning Tree can be
     decoded using Edmond's algorithm by viewing the dependency tree as
     a MST on a fully connected graph, where nodes are words and edges
     are scored dependency arcs.
@@ -138,7 +138,7 @@ class BiaffineDependencyParser(Model):
         tags = self.vocab.get_token_to_index_vocabulary("pos")
         punctuation_tag_indices = {tag: index for tag, index in tags.items() if tag in POS_TO_IGNORE}
         self._pos_to_ignore = set(punctuation_tag_indices.values())
-        logger.info(f"Found POS tags correspoding to the following punctuation : {punctuation_tag_indices}. "
+        logger.info(f"Found POS tags corresponding to the following punctuation : {punctuation_tag_indices}. "
                     "Ignoring words with these POS tags for evaluation.")
 
         self._attachment_scores = AttachmentScores()
@@ -148,6 +148,7 @@ class BiaffineDependencyParser(Model):
     def forward(self,  # type: ignore
                 words: Dict[str, torch.LongTensor],
                 pos_tags: torch.LongTensor,
+                metadata: List[Dict[str, Any]],
                 head_tags: torch.LongTensor = None,
                 head_indices: torch.LongTensor = None) -> Dict[str, torch.Tensor]:
         # pylint: disable=arguments-differ
@@ -163,11 +164,17 @@ class BiaffineDependencyParser(Model):
             sequence.  The dictionary is designed to be passed directly to a ``TextFieldEmbedder``,
             which knows how to combine different word representations into a single vector per
             token in your input.
-        pos_tags : ``torch.LongTensor``, required.
+        pos_tags : ``torch.LongTensor``, required
             The output of a ``SequenceLabelField`` containing POS tags.
             POS tags are required regardless of whether they are used in the model,
             because they are used to filter the evaluation metric to only consider
             heads of words which are not punctuation.
+        metadata : List[Dict[str, Any]], optional (default=None)
+            A dictionary of metadata for each batch element which has keys:
+                words : ``List[str]``, required.
+                    The tokens in the original sentence.
+                pos : ``List[str]``, required.
+                    The dependencies POS tags for each word.
         head_tags : torch.LongTensor, optional (default = None)
             A torch tensor representing the sequence of integer gold class labels for the arcs
             in the dependency parse. Has shape ``(batch_size, sequence_length)``.
@@ -202,6 +209,64 @@ class BiaffineDependencyParser(Model):
             raise ConfigurationError("Model uses a POS embedding, but no POS tags were passed.")
 
         mask = get_text_field_mask(words)
+
+        predicted_heads, predicted_head_tags, mask, arc_nll, tag_nll = self._parse(
+                embedded_text_input, mask, head_tags, head_indices)
+
+        loss = arc_nll + tag_nll
+
+        if head_indices is not None and head_tags is not None:
+            evaluation_mask = self._get_mask_for_eval(mask[:, 1:], pos_tags)
+            # We calculate attatchment scores for the whole sentence
+            # but excluding the symbolic ROOT token at the start,
+            # which is why we start from the second element in the sequence.
+            self._attachment_scores(predicted_heads[:, 1:],
+                                    predicted_head_tags[:, 1:],
+                                    head_indices,
+                                    head_tags,
+                                    evaluation_mask)
+
+        output_dict = {
+                "heads": predicted_heads,
+                "head_tags": predicted_head_tags,
+                "arc_loss": arc_nll,
+                "tag_loss": tag_nll,
+                "loss": loss,
+                "mask": mask,
+                "words": [meta["words"] for meta in metadata],
+                "pos": [meta["pos"] for meta in metadata]
+                }
+
+        return output_dict
+
+    @overrides
+    def decode(self, output_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+
+        head_tags = output_dict.pop("head_tags").cpu().detach().numpy()
+        heads = output_dict.pop("heads").cpu().detach().numpy()
+        mask = output_dict.pop("mask")
+        lengths = get_lengths_from_binary_sequence_mask(mask)
+        head_tag_labels = []
+        head_indices = []
+        for instance_heads, instance_tags, length in zip(heads, head_tags, lengths):
+            instance_heads = list(instance_heads[1:length])
+            instance_tags = instance_tags[1:length]
+            labels = [self.vocab.get_token_from_index(label, "head_tags")
+                      for label in instance_tags]
+            head_tag_labels.append(labels)
+            head_indices.append(instance_heads)
+
+        output_dict["predicted_dependencies"] = head_tag_labels
+        output_dict["predicted_heads"] = head_indices
+        return output_dict
+
+    def _parse(self,
+               embedded_text_input: torch.Tensor,
+               mask: torch.LongTensor,
+               head_tags: torch.LongTensor = None,
+               head_indices: torch.LongTensor = None
+              ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
         embedded_text_input = self._input_dropout(embedded_text_input)
         encoded_text = self.encoder(embedded_text_input, mask)
 
@@ -251,17 +316,6 @@ class BiaffineDependencyParser(Model):
                                                     head_indices=head_indices,
                                                     head_tags=head_tags,
                                                     mask=mask)
-            loss = arc_nll + tag_nll
-
-            evaluation_mask = self._get_mask_for_eval(mask[:, 1:], pos_tags)
-            # We calculate attatchment scores for the whole sentence
-            # but excluding the symbolic ROOT token at the start,
-            # which is why we start from the second element in the sequence.
-            self._attachment_scores(predicted_heads[:, 1:],
-                                    predicted_head_tags[:, 1:],
-                                    head_indices[:, 1:],
-                                    head_tags[:, 1:],
-                                    evaluation_mask)
         else:
             arc_nll, tag_nll = self._construct_loss(head_tag_representation=head_tag_representation,
                                                     child_tag_representation=child_tag_representation,
@@ -269,38 +323,8 @@ class BiaffineDependencyParser(Model):
                                                     head_indices=predicted_heads.long(),
                                                     head_tags=predicted_head_tags.long(),
                                                     mask=mask)
-            loss = arc_nll + tag_nll
 
-        output_dict = {
-                "heads": predicted_heads,
-                "head_tags": predicted_head_tags,
-                "arc_loss": arc_nll,
-                "tag_loss": tag_nll,
-                "loss": loss,
-                "mask": mask
-                }
-
-        return output_dict
-
-    @overrides
-    def decode(self, output_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-
-        head_tags = output_dict["head_tags"].cpu().detach().numpy()
-        heads = output_dict["heads"].cpu().detach().numpy()
-        lengths = get_lengths_from_binary_sequence_mask(output_dict["mask"])
-        head_tag_labels = []
-        head_indices = []
-        for instance_heads, instance_tags, length in zip(heads, head_tags, lengths):
-            instance_heads = list(instance_heads[1:length])
-            instance_tags = instance_tags[1:length]
-            labels = [self.vocab.get_token_from_index(label, "head_tags")
-                      for label in instance_tags]
-            head_tag_labels.append(labels)
-            head_indices.append(instance_heads)
-
-        output_dict["predicted_dependencies"] = head_tag_labels
-        output_dict["predicted_heads"] = head_indices
-        return output_dict
+        return predicted_heads, predicted_head_tags, mask, arc_nll, tag_nll
 
     def _construct_loss(self,
                         head_tag_representation: torch.Tensor,
@@ -324,7 +348,7 @@ class BiaffineDependencyParser(Model):
             for the given arcs.
         attended_arcs : ``torch.Tensor``, required.
             A tensor of shape (batch_size, sequence_length, sequence_length) used to generate
-            a distribution over attachements of a given word to all other words.
+            a distribution over attachments of a given word to all other words.
         head_indices : ``torch.Tensor``, required.
             A tensor of shape (batch_size, sequence_length).
             The indices of the heads for every word.
@@ -347,13 +371,13 @@ class BiaffineDependencyParser(Model):
         # shape (batch_size, 1)
         range_vector = get_range_vector(batch_size, get_device_of(attended_arcs)).unsqueeze(1)
         # shape (batch_size, sequence_length, sequence_length)
-        normalised_arc_logits = last_dim_log_softmax(attended_arcs,
-                                                     mask) * float_mask.unsqueeze(2) * float_mask.unsqueeze(1)
+        normalised_arc_logits = masked_log_softmax(attended_arcs,
+                                                   mask) * float_mask.unsqueeze(2) * float_mask.unsqueeze(1)
 
         # shape (batch_size, sequence_length, num_head_tags)
         head_tag_logits = self._get_head_tags(head_tag_representation, child_tag_representation, head_indices)
-        normalised_head_tag_logits = last_dim_log_softmax(head_tag_logits,
-                                                          mask.unsqueeze(-1)) * float_mask.unsqueeze(-1)
+        normalised_head_tag_logits = masked_log_softmax(head_tag_logits,
+                                                        mask.unsqueeze(-1)) * float_mask.unsqueeze(-1)
         # index matrix with shape (batch, sequence_length)
         timestep_index = get_range_vector(sequence_length, get_device_of(attended_arcs))
         child_index = timestep_index.view(1, sequence_length).expand(batch_size, sequence_length).long()
@@ -381,7 +405,7 @@ class BiaffineDependencyParser(Model):
         """
         Decodes the head and head tag predictions by decoding the unlabeled arcs
         independently for each word and then again, predicting the head tags of
-        these greedily chosen arcs indpendently. Note that this method of decoding
+        these greedily chosen arcs independently. Note that this method of decoding
         is not guaranteed to produce trees (i.e. there maybe be multiple roots,
         or cycles when children are attached to their parents).
 
@@ -397,7 +421,7 @@ class BiaffineDependencyParser(Model):
             for the given arcs.
         attended_arcs : ``torch.Tensor``, required.
             A tensor of shape (batch_size, sequence_length, sequence_length) used to generate
-            a distribution over attachements of a given word to all other words.
+            a distribution over attachments of a given word to all other words.
 
         Returns
         -------
@@ -452,7 +476,7 @@ class BiaffineDependencyParser(Model):
             for the given arcs.
         attended_arcs : ``torch.Tensor``, required.
             A tensor of shape (batch_size, sequence_length, sequence_length) used to generate
-            a distribution over attachements of a given word to all other words.
+            a distribution over attachments of a given word to all other words.
 
         Returns
         -------
@@ -487,17 +511,41 @@ class BiaffineDependencyParser(Model):
 
         # Shape (batch_size, sequence_length, sequence_length)
         normalized_arc_logits = F.log_softmax(attended_arcs, dim=2).transpose(1, 2)
-        # Shape (batch_size, num_head_tags, sequence_length, sequence_length)
-        batch_energy = torch.exp(normalized_arc_logits.unsqueeze(1) + normalized_pairwise_head_logits)
 
+        # Shape (batch_size, num_head_tags, sequence_length, sequence_length)
+        # This energy tensor expresses the following relation:
+        # energy[i,j] = "Score that i is the head of j". In this
+        # case, we have heads pointing to their children.
+        batch_energy = torch.exp(normalized_arc_logits.unsqueeze(1) + normalized_pairwise_head_logits)
+        return self._run_mst_decoding(batch_energy, lengths)
+
+    @staticmethod
+    def _run_mst_decoding(batch_energy: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         heads = []
         head_tags = []
-        for energy, length in zip(batch_energy.detach().cpu().numpy(), lengths):
-            head, head_tag = decode_mst(energy, length)
-            heads.append(head)
-            head_tags.append(head_tag)
-        return torch.from_numpy(numpy.stack(heads)), torch.from_numpy(numpy.stack(head_tags))
+        for energy, length in zip(batch_energy.detach().cpu(), lengths):
+            scores, tag_ids = energy.max(dim=0)
+            # Although we need to include the root node so that the MST includes it,
+            # we do not want any word to be the parent of the root node.
+            # Here, we enforce this by setting the scores for all word -> ROOT edges
+            # edges to be 0.
+            scores[0, :] = 0
+            # Decode the heads. Because we modify the scores to prevent
+            # adding in word -> ROOT edges, we need to find the labels ourselves.
+            instance_heads, _ = decode_mst(scores.numpy(), length, has_labels=False)
 
+            # Find the labels which correspond to the edges in the max spanning tree.
+            instance_head_tags = []
+            for child, parent in enumerate(instance_heads):
+                instance_head_tags.append(tag_ids[parent, child].item())
+            # We don't care what the head or tag is for the root token, but by default it's
+            # not necesarily the same in the batched vs unbatched case, which is annoying.
+            # Here we'll just set them to zero.
+            instance_heads[0] = 0
+            instance_head_tags[0] = 0
+            heads.append(instance_heads)
+            head_tags.append(instance_head_tags)
+        return torch.from_numpy(numpy.stack(heads)), torch.from_numpy(numpy.stack(head_tags))
 
     def _get_head_tags(self,
                        head_tag_representation: torch.Tensor,

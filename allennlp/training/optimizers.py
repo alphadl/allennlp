@@ -1,18 +1,18 @@
 """
 AllenNLP just uses
-`PyTorch optimizers <http://pytorch.org/docs/master/optim.html>`_ ,
+`PyTorch optimizers <https://pytorch.org/docs/master/optim.html>`_ ,
 with a thin wrapper to allow registering them and instantiating them ``from_params``.
 
 The available optimizers are
 
-* `"adadelta" <http://pytorch.org/docs/master/optim.html#torch.optim.Adadelta>`_
-* `"adagrad" <http://pytorch.org/docs/master/optim.html#torch.optim.Adagrad>`_
-* `"adam" <http://pytorch.org/docs/master/optim.html#torch.optim.Adam>`_
-* `"sparse_adam" <http://pytorch.org/docs/master/optim.html#torch.optim.SparseAdam>`_
-* `"sgd" <http://pytorch.org/docs/master/optim.html#torch.optim.SGD>`_
-* `"rmsprop <http://pytorch.org/docs/master/optim.html#torch.optim.RMSprop>`_
-* `"adamax <http://pytorch.org/docs/master/optim.html#torch.optim.Adamax>`_
-* `"averaged_sgd <http://pytorch.org/docs/master/optim.html#torch.optim.ASGD>`_
+* `"adadelta" <https://pytorch.org/docs/master/optim.html#torch.optim.Adadelta>`_
+* `"adagrad" <https://pytorch.org/docs/master/optim.html#torch.optim.Adagrad>`_
+* `"adam" <https://pytorch.org/docs/master/optim.html#torch.optim.Adam>`_
+* `"sparse_adam" <https://pytorch.org/docs/master/optim.html#torch.optim.SparseAdam>`_
+* `"sgd" <https://pytorch.org/docs/master/optim.html#torch.optim.SGD>`_
+* `"rmsprop <https://pytorch.org/docs/master/optim.html#torch.optim.RMSprop>`_
+* `"adamax <https://pytorch.org/docs/master/optim.html#torch.optim.Adamax>`_
+* `"averaged_sgd <https://pytorch.org/docs/master/optim.html#torch.optim.ASGD>`_
 """
 
 import logging
@@ -21,6 +21,7 @@ import math
 from typing import List, Any, Dict
 
 import torch
+from pytorch_pretrained_bert.optimization import BertAdam
 
 from allennlp.common import Params, Registrable
 
@@ -51,12 +52,12 @@ class Optimizer(Registrable):
             # e.g., {'params': [list of parameters], 'lr': 1e-3, ...}
             # Any config option not specified in the additional options (e.g.
             # for the default group) is inherited from the top level config.
-            # see: http://pytorch.org/docs/0.3.0/optim.html?#per-parameter-options
+            # see: https://pytorch.org/docs/0.3.0/optim.html?#per-parameter-options
             #
             # groups contains something like:
             #"parameter_groups": [
-            #       [["regex1", "regex2"], {"lr": 1e-3},
-            #        ["regex3"], {"lr": 1e-4}]
+            #       [["regex1", "regex2"], {"lr": 1e-3}],
+            #       [["regex3"], {"lr": 1e-4}]
             #]
             #(note that the allennlp config files require double quotes ", and will
             # fail (sometimes silently) with single quotes ').
@@ -112,7 +113,28 @@ class Optimizer(Registrable):
         else:
             parameter_groups = [param for name, param in model_parameters]
 
-        return Optimizer.by_name(optimizer)(parameter_groups, **params.as_dict()) # type: ignore
+        # Log the number of parameters to optimize
+        num_parameters = 0
+        for parameter_group in parameter_groups:
+            if isinstance(parameter_group, dict):
+                num_parameters += sum(parameter.numel() for parameter in parameter_group["params"])
+            else:
+                num_parameters += parameter_group.numel()
+        logger.info("Number of trainable parameters: %s", num_parameters)
+
+        # By default we cast things that e.g. look like floats to floats before handing them
+        # to the Optimizer constructor, but if you want to disable that behavior you could add a
+        #       "infer_type_and_cast": false
+        # key to your "trainer.optimizer" config.
+        infer_type_and_cast = params.pop_bool("infer_type_and_cast", True)
+        params_as_dict = params.as_dict(infer_type_and_cast=infer_type_and_cast)
+        subclass = Optimizer.by_name(optimizer)
+
+        # If the optimizer subclass has a from_params, use it.
+        if hasattr(subclass, 'from_params'):
+            return subclass.from_params(parameter_groups, params=params)
+        else:
+            return subclass(parameter_groups, **params_as_dict) # type: ignore
 
 # We just use the Pytorch optimizers, so here we force them into
 # Registry._registry so we can build them from params.
@@ -125,8 +147,20 @@ Registrable._registry[Optimizer] = {   # pylint: disable=protected-access
         "rmsprop": torch.optim.RMSprop,
         "adamax": torch.optim.Adamax,
         "averaged_sgd": torch.optim.ASGD,
+        "bert_adam": BertAdam,
 }
 
+def _safe_sparse_mask(tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    In PyTorch 1.0, Tensor._sparse_mask was changed to Tensor.sparse_mask.
+    This wrapper allows AllenNLP to (temporarily) work with both 1.0 and 0.4.1.
+    """
+    # pylint: disable=protected-access
+    try:
+        return tensor.sparse_mask(mask)
+    except AttributeError:
+        # TODO(joelgrus): remove this and/or warn at some point
+        return tensor._sparse_mask(mask)
 
 
 @Optimizer.register('dense_sparse_adam')
@@ -214,14 +248,14 @@ class DenseSparseAdam(torch.optim.Optimizer):
                     # Decay the first and second moment running average coefficient
                     #      old <- b * old + (1 - b) * new
                     # <==> old += (1 - b) * (new - old)
-                    old_exp_avg_values = exp_avg._sparse_mask(grad)._values()
+                    old_exp_avg_values = _safe_sparse_mask(exp_avg, grad)._values()
                     exp_avg_update_values = grad_values.sub(old_exp_avg_values).mul_(1 - beta1)
                     exp_avg.add_(make_sparse(exp_avg_update_values))
-                    old_exp_avg_sq_values = exp_avg_sq._sparse_mask(grad)._values()
+                    old_exp_avg_sq_values = _safe_sparse_mask(exp_avg_sq, grad)._values()
                     exp_avg_sq_update_values = grad_values.pow(2).sub_(old_exp_avg_sq_values).mul_(1 - beta2)
                     exp_avg_sq.add_(make_sparse(exp_avg_sq_update_values))
 
-                    # Dense addition again is intended, avoiding another _sparse_mask
+                    # Dense addition again is intended, avoiding another sparse_mask
                     numer = exp_avg_update_values.add_(old_exp_avg_values)
                     exp_avg_sq_update_values.add_(old_exp_avg_sq_values)
                     denom = exp_avg_sq_update_values.sqrt_().add_(group['eps'])

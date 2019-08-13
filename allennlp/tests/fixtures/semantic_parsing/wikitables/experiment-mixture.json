@@ -10,10 +10,12 @@
     "type": "wikitables_mml_parser",
     "tables_directory": "allennlp/tests/fixtures/data/wikitables/",
     "question_embedder": {
-      "tokens": {
-        "type": "embedding",
-        "embedding_dim": 25,
-        "trainable": true
+      "token_embedders": {
+        "tokens": {
+          "type": "embedding",
+          "embedding_dim": 25,
+          "trainable": true
+        }
       }
     },
     "action_embedding_dim": 50,
@@ -22,7 +24,7 @@
       "num_layers": 3,
       "hidden_dims": [5, 2, 1],
       "activations": ["relu", "sigmoid", "sigmoid"],
-      "dropout": [0.2, 0.0, 0.0]
+      "dropout": [0.0, 0.0, 0.0]
     },
     "encoder": {
       "type": "lstm",

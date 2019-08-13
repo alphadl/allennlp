@@ -39,14 +39,24 @@ class PennTreeBankConstituencySpanDatasetReader(DatasetReader):
         as a field.
     lazy : ``bool``, optional, (default = ``False``)
         Whether or not instances can be consumed lazily.
+    label_namespace_prefix : ``str``, optional, (default = ``""``)
+        Prefix used for the label namespace.  The ``span_labels`` will use
+        namespace ``label_namespace_prefix + 'labels'``, and if using POS
+        tags their namespace is ``label_namespace_prefix + pos_label_namespace``.
+    pos_label_namespace : ``str``, optional, (default = ``"pos"``)
+        The POS tag namespace is ``label_namespace_prefix + pos_label_namespace``.
     """
     def __init__(self,
                  token_indexers: Dict[str, TokenIndexer] = None,
                  use_pos_tags: bool = True,
-                 lazy: bool = False) -> None:
+                 lazy: bool = False,
+                 label_namespace_prefix: str = "",
+                 pos_label_namespace: str = "pos") -> None:
         super().__init__(lazy=lazy)
         self._token_indexers = token_indexers or {'tokens': SingleIdTokenIndexer()}
         self._use_pos_tags = use_pos_tags
+        self._label_namespace_prefix = label_namespace_prefix
+        self._pos_label_namespace = pos_label_namespace
 
     @overrides
     def _read(self, file_path):
@@ -59,7 +69,7 @@ class PennTreeBankConstituencySpanDatasetReader(DatasetReader):
             self._strip_functional_tags(parse)
             # This is un-needed and clutters the label space.
             # All the trees also contain a root S node.
-            if parse.label() == "VROOT":
+            if parse.label() == "VROOT" or parse.label() == "TOP":
                 parse = parse[0]
             pos_tags = [x[1] for x in parse.pos()] if self._use_pos_tags else None
             yield self.text_to_instance(parse.leaves(), pos_tags, parse)
@@ -76,7 +86,7 @@ class PennTreeBankConstituencySpanDatasetReader(DatasetReader):
         ----------
         tokens : ``List[str]``, required.
             The tokens in a given sentence.
-        pos_tags ``List[str]``, optional, (default = None).
+        pos_tags : ``List[str]``, optional, (default = None).
             The POS tags for the words in the sentence.
         gold_tree : ``Tree``, optional (default = None).
             The gold parse tree to create span labels from.
@@ -93,7 +103,7 @@ class PennTreeBankConstituencySpanDatasetReader(DatasetReader):
                 A ListField containing all possible subspans of the
                 sentence.
             span_labels : ``SequenceLabelField``, optional.
-                The constiutency tags for each of the possible spans, with
+                The constituency tags for each of the possible spans, with
                 respect to a gold parse tree. If a span is not contained
                 within the tree, a span will have a ``NO-LABEL`` label.
             gold_tree : ``MetadataField(Tree)``
@@ -103,8 +113,10 @@ class PennTreeBankConstituencySpanDatasetReader(DatasetReader):
         text_field = TextField([Token(x) for x in tokens], token_indexers=self._token_indexers)
         fields: Dict[str, Field] = {"tokens": text_field}
 
+        pos_namespace = self._label_namespace_prefix + self._pos_label_namespace
         if self._use_pos_tags and pos_tags is not None:
-            pos_tag_field = SequenceLabelField(pos_tags, text_field, label_namespace="pos")
+            pos_tag_field = SequenceLabelField(pos_tags, text_field,
+                                               label_namespace=pos_namespace)
             fields["pos_tags"] = pos_tag_field
         elif self._use_pos_tags:
             raise ConfigurationError("use_pos_tags was set to True but no gold pos"
@@ -122,10 +134,7 @@ class PennTreeBankConstituencySpanDatasetReader(DatasetReader):
             spans.append(SpanField(start, end, text_field))
 
             if gold_spans is not None:
-                if (start, end) in gold_spans.keys():
-                    gold_labels.append(gold_spans[(start, end)])
-                else:
-                    gold_labels.append("NO-LABEL")
+                gold_labels.append(gold_spans.get((start, end), "NO-LABEL"))
 
         metadata = {"tokens": tokens}
         if gold_tree:
@@ -139,7 +148,8 @@ class PennTreeBankConstituencySpanDatasetReader(DatasetReader):
         fields["spans"] = span_list_field
         if gold_tree is not None:
             fields["span_labels"] = SequenceLabelField(gold_labels,
-                                                       span_list_field)
+                                                       span_list_field,
+                                                       label_namespace=self._label_namespace_prefix + "labels")
         return Instance(fields)
 
     def _strip_functional_tags(self, tree: Tree) -> None:

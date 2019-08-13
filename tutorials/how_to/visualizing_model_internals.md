@@ -1,7 +1,7 @@
 # Visualizing model internals in a live demo
 
 We recently added an attention visualization to the live BiDAF demo on
-[allennlp.org](http://demo.allennlp.org/machine-comprehension).  Here's what it looks like:
+[allennlp.org](https://demo.allennlp.org/machine-comprehension).  Here's what it looks like:
 
 ![demo screenshot](visualization_images/bidaf_attention_demo.png)
 
@@ -13,9 +13,10 @@ parts of our models need fixing.
 
 ## Pre-requisites
 
-1. You need to have a text in / text out demo of your model already running using our simple
-   server.  See the [tutorial on creating a
-demo](../getting_started/making_predictions_and_creating_a_demo.md) for how to do this.
+1. You need to have a text-in-json-out demo of your model already running using our simple
+   server. This demo server will act as a backend with which the react server will interact and produce results.
+   See the [tutorial on creating a
+demo](../getting_started/predicting_paper_venues/predicting_paper_venues_pt2.md) for how to do this.
 2. We'll be using a React app to generate HTML and javascript for the fancier demo, so you need to
    have `npm` and `node.js` installed.  There are plenty of guides for how to install these on the
 web, sometimes with one-line shell commands.  On MacOS with homebrew, you can just run `brew
@@ -57,7 +58,7 @@ visualize in the text output returned by the simple server you set up in the pre
 
 We've [set up a repository](https://github.com/allenai/allennlp-simple-server-visualization) with a
 stripped-down version of the code that runs the demo on
-[demo.allennlp.org](http://demo.allennlp.org).  Clone that repository and copy the `demo/`
+[demo.allennlp.org](https://demo.allennlp.org).  Clone that repository and copy the `demo/`
 directory to wherever you want.  `cd` to that directory, and run `npm install`, then `npm start`.
 That should show a screen in your terminal that says "Compiled successfully!", directing you to
 view your demo in a browser at `localhost:3000`.  If you go there, you should see a page that says

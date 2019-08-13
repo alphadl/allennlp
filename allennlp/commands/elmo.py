@@ -5,7 +5,7 @@ Given a pre-processed input text file, this command outputs the internal
 layers used to compute ELMo representations to a single (potentially large) file.
 
 The input file is previously tokenized, whitespace separated text, one sentence per line.
-The output is a hdf5 file (<http://docs.h5py.org/en/latest/>) where, with the --all flag, each
+The output is a hdf5 file (<https://h5py.readthedocs.io/en/latest/>) where, with the --all flag, each
 sentence is a size (3, num_tokens, 1024) array with the biLM representations.
 
 For information, see "Deep contextualized word representations", Peters et al 2018.
@@ -57,6 +57,7 @@ https://arxiv.org/abs/1802.05365
 import argparse
 import json
 import logging
+import os
 from typing import IO, List, Iterable, Tuple
 import warnings
 
@@ -68,7 +69,7 @@ import numpy
 import torch
 
 from allennlp.common.tqdm import Tqdm
-from allennlp.common.util import lazy_groups_of
+from allennlp.common.util import lazy_groups_of, prepare_global_logging
 from allennlp.common.checks import ConfigurationError
 from allennlp.data.token_indexers.elmo_indexer import ELMoTokenCharactersIndexer
 from allennlp.nn.util import remove_sentence_boundaries
@@ -77,8 +78,8 @@ from allennlp.commands.subcommand import Subcommand
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
-DEFAULT_OPTIONS_FILE = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_options.json" # pylint: disable=line-too-long
-DEFAULT_WEIGHT_FILE = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5" # pylint: disable=line-too-long
+DEFAULT_OPTIONS_FILE = "https://allennlp.s3.amazonaws.com/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_options.json" # pylint: disable=line-too-long
+DEFAULT_WEIGHT_FILE = "https://allennlp.s3.amazonaws.com/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5" # pylint: disable=line-too-long
 DEFAULT_BATCH_SIZE = 64
 
 
@@ -94,9 +95,10 @@ class Elmo(Subcommand):
         # pylint: disable=protected-access
         description = '''Create word vectors using ELMo.'''
         subparser = parser.add_parser(
-                name, description=description, help='Use a trained model to make predictions.')
+                name, description=description, help='Create word vectors using a pretrained ELMo model.')
 
-        subparser.add_argument('input_file', type=argparse.FileType('r'), help='The path to the input file.')
+        subparser.add_argument('input_file', type=argparse.FileType('r', encoding='utf-8'),
+                               help='The path to the input file.')
         subparser.add_argument('output_file', type=str, help='The path to the output file.')
 
         group = subparser.add_mutually_exclusive_group(required=True)
@@ -116,6 +118,8 @@ class Elmo(Subcommand):
                 default=DEFAULT_WEIGHT_FILE,
                 help='The path to the ELMo weight file.')
         subparser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE, help='The batch size to use.')
+        subparser.add_argument('--file-friendly-logging', default=False, action='store_true',
+                               help='outputs tqdm status on separate lines and slows tqdm refresh rate.')
         subparser.add_argument('--cuda-device', type=int, default=-1, help='The cuda_device to run on.')
         subparser.add_argument(
                 '--forget-sentences',
@@ -369,6 +373,8 @@ def elmo_command(args):
         output_format = "top"
     elif args.average:
         output_format = "average"
+
+    prepare_global_logging(os.path.realpath(os.path.dirname(args.output_file)), args.file_friendly_logging)
 
     with torch.no_grad():
         elmo_embedder.embed_file(

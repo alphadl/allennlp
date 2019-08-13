@@ -1,6 +1,8 @@
 from typing import Dict, List
+import itertools
 
 from overrides import overrides
+import torch
 
 from allennlp.common.util import pad_sequence_to_length
 from allennlp.data.vocabulary import Vocabulary
@@ -20,11 +22,26 @@ class SingleIdTokenIndexer(TokenIndexer[int]):
     lowercase_tokens : ``bool``, optional (default=``False``)
         If ``True``, we will call ``token.lower()`` before getting an index for the token from the
         vocabulary.
+    start_tokens : ``List[str]``, optional (default=``None``)
+        These are prepended to the tokens provided to ``tokens_to_indices``.
+    end_tokens : ``List[str]``, optional (default=``None``)
+        These are appended to the tokens provided to ``tokens_to_indices``.
+    token_min_padding_length : ``int``, optional (default=``0``)
+        See :class:`TokenIndexer`.
     """
     # pylint: disable=no-self-use
-    def __init__(self, namespace: str = 'tokens', lowercase_tokens: bool = False) -> None:
+    def __init__(self,
+                 namespace: str = 'tokens',
+                 lowercase_tokens: bool = False,
+                 start_tokens: List[str] = None,
+                 end_tokens: List[str] = None,
+                 token_min_padding_length: int = 0) -> None:
+        super().__init__(token_min_padding_length)
         self.namespace = namespace
         self.lowercase_tokens = lowercase_tokens
+
+        self._start_tokens = [Token(st) for st in (start_tokens or [])]
+        self._end_tokens = [Token(et) for et in (end_tokens or [])]
 
     @overrides
     def count_vocab_items(self, token: Token, counter: Dict[str, Dict[str, int]]):
@@ -43,7 +60,7 @@ class SingleIdTokenIndexer(TokenIndexer[int]):
                           index_name: str) -> Dict[str, List[int]]:
         indices: List[int] = []
 
-        for token in tokens:
+        for token in itertools.chain(self._start_tokens, tokens, self._end_tokens):
             if getattr(token, 'text_id', None) is not None:
                 # `text_id` being set on the token means that we aren't using the vocab, we just use
                 # this id instead.
@@ -57,17 +74,13 @@ class SingleIdTokenIndexer(TokenIndexer[int]):
         return {index_name: indices}
 
     @overrides
-    def get_padding_token(self) -> int:
-        return 0
-
-    @overrides
     def get_padding_lengths(self, token: int) -> Dict[str, int]:  # pylint: disable=unused-argument
         return {}
 
     @overrides
-    def pad_token_sequence(self,
-                           tokens: Dict[str, List[int]],
-                           desired_num_tokens: Dict[str, int],
-                           padding_lengths: Dict[str, int]) -> Dict[str, List[int]]:  # pylint: disable=unused-argument
-        return {key: pad_sequence_to_length(val, desired_num_tokens[key])
+    def as_padded_tensor(self,
+                         tokens: Dict[str, List[int]],
+                         desired_num_tokens: Dict[str, int],
+                         padding_lengths: Dict[str, int]) -> Dict[str, torch.Tensor]:  # pylint: disable=unused-argument
+        return {key: torch.LongTensor(pad_sequence_to_length(val, desired_num_tokens[key]))
                 for key, val in tokens.items()}

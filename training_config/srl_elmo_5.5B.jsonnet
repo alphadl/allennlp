@@ -15,8 +15,8 @@
             "token_embedders": {
                 "elmo": {
                     "type": "elmo_token_embedder",
-                    "options_file": "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway_5.5B/elmo_2x4096_512_2048cnn_2xhighway_5.5B_options.json",
-                    "weight_file": "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway_5.5B/elmo_2x4096_512_2048cnn_2xhighway_5.5B_weights.hdf5",
+                    "options_file": "https://allennlp.s3.amazonaws.com/models/elmo/2x4096_512_2048cnn_2xhighway_5.5B/elmo_2x4096_512_2048cnn_2xhighway_5.5B_options.json",
+                    "weight_file": "https://allennlp.s3.amazonaws.com/models/elmo/2x4096_512_2048cnn_2xhighway_5.5B/elmo_2x4096_512_2048cnn_2xhighway_5.5B_weights.hdf5",
                     "do_layer_norm": false,
                     "dropout": 0.1
                 }
@@ -31,9 +31,6 @@
             ]
         ],
         // NOTE: This configuration is correct, but slow.
-        // If you are interested in training the SRL model
-        // from scratch, you should use the 'alternating_lstm_cuda'
-        // encoder instead.
         "encoder": {
             "type": "alternating_lstm",
             "input_size": 1124,

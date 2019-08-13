@@ -1,3 +1,5 @@
+// Configuration for a semantic role labeler model based on:
+//   He, Luheng et al. “Deep Semantic Role Labeling: What Works and What's Next.” ACL (2017).
 {
   "dataset_reader":{"type":"srl"},
   "train_data_path": std.extVar("SRL_TRAIN_DATA_PATH"),
@@ -9,7 +11,7 @@
         "tokens": {
             "type": "embedding",
             "embedding_dim": 100,
-            "pretrained_file": "https://s3-us-west-2.amazonaws.com/allennlp/datasets/glove/glove.6B.100d.txt.gz",
+            "pretrained_file": "https://allennlp.s3.amazonaws.com/datasets/glove/glove.6B.100d.txt.gz",
             "trainable": true
         }
       }

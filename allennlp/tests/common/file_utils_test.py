@@ -7,7 +7,9 @@ import json
 import pytest
 import responses
 
-from allennlp.common.file_utils import url_to_filename, filename_to_url, get_from_cache, cached_path
+from allennlp.common.file_utils import (
+        url_to_filename, filename_to_url, get_from_cache, cached_path, split_s3_path,
+        )
 from allennlp.common.testing import AllenNlpTestCase
 
 
@@ -57,7 +59,7 @@ class TestFileUtils(AllenNlpTestCase):
     def test_url_to_filename(self):
         for url in ['http://allenai.org', 'http://allennlp.org',
                     'https://www.google.com', 'http://pytorch.org',
-                    'https://s3-us-west-2.amazonaws.com/allennlp' + '/long' * 20 + '/url']:
+                    'https://allennlp.s3.amazonaws.com' + '/long' * 20 + '/url']:
             filename = url_to_filename(url)
             assert "http" not in filename
             with pytest.raises(FileNotFoundError):
@@ -96,6 +98,17 @@ class TestFileUtils(AllenNlpTestCase):
             back_to_url, etag = filename_to_url(filename, cache_dir=self.TEST_DIR)
             assert back_to_url == url
             assert etag == "mytag"
+
+    def test_split_s3_path(self):
+        # Test splitting good urls.
+        assert split_s3_path("s3://my-bucket/subdir/file.txt") == ("my-bucket", "subdir/file.txt")
+        assert split_s3_path("s3://my-bucket/file.txt") == ("my-bucket", "file.txt")
+
+        # Test splitting bad urls.
+        with pytest.raises(ValueError):
+            split_s3_path("s3://")
+            split_s3_path("s3://myfile.txt")
+            split_s3_path("myfile.txt")
 
     @responses.activate
     def test_get_from_cache(self):

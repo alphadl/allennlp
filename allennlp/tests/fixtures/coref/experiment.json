@@ -10,7 +10,8 @@
         "type": "characters",
         "character_tokenizer": {
           "byte_encoding": "utf-8"
-        }
+        },
+        "min_padding_length": 5
       }
     },
     "max_span_width": 5
@@ -38,7 +39,7 @@
             "num_filters": 10,
             "ngram_filter_sizes": [5]
             },
-            "dropout": 0.2
+            "dropout": 0.0
         }
       }
     },

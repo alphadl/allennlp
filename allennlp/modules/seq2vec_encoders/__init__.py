@@ -6,12 +6,13 @@ others are AllenNLP modules.
 
 The available Seq2Vec encoders are
 
-* `"gru" <http://pytorch.org/docs/master/nn.html#torch.nn.GRU>`_
-* `"lstm" <http://pytorch.org/docs/master/nn.html#torch.nn.LSTM>`_
-* `"rnn" <http://pytorch.org/docs/master/nn.html#torch.nn.RNN>`_
+* `"gru" <https://pytorch.org/docs/master/nn.html#torch.nn.GRU>`_
+* `"lstm" <https://pytorch.org/docs/master/nn.html#torch.nn.LSTM>`_
+* `"rnn" <https://pytorch.org/docs/master/nn.html#torch.nn.RNN>`_
 * :class:`"cnn" <allennlp.modules.seq2vec_encoders.cnn_encoder.CnnEncoder>`
 * :class:`"augmented_lstm" <allennlp.modules.augmented_lstm.AugmentedLstm>`
 * :class:`"alternating_lstm" <allennlp.modules.stacked_alternating_lstm.StackedAlternatingLstm>`
+* :class:`"stacked_bidirectional_lstm" <allennlp.modules.stacked_bidirectional_lstm.StackedBidirectionalLstm>`
 """
 
 from typing import Type
@@ -21,11 +22,14 @@ import torch
 from allennlp.common import Params
 from allennlp.common.checks import ConfigurationError
 from allennlp.modules.seq2vec_encoders.cnn_encoder import CnnEncoder
+from allennlp.modules.seq2vec_encoders.cnn_highway_encoder import CnnHighwayEncoder
+from allennlp.modules.seq2vec_encoders.bert_pooler import BertPooler
 from allennlp.modules.seq2vec_encoders.boe_encoder import BagOfEmbeddingsEncoder
 from allennlp.modules.seq2vec_encoders.pytorch_seq2vec_wrapper import PytorchSeq2VecWrapper
 from allennlp.modules.seq2vec_encoders.seq2vec_encoder import Seq2VecEncoder
 from allennlp.modules.augmented_lstm import AugmentedLstm
 from allennlp.modules.stacked_alternating_lstm import StackedAlternatingLstm
+from allennlp.modules.stacked_bidirectional_lstm import StackedBidirectionalLstm
 
 
 class _Seq2VecWrapper:
@@ -76,3 +80,4 @@ Seq2VecEncoder.register("lstm")(_Seq2VecWrapper(torch.nn.LSTM))
 Seq2VecEncoder.register("rnn")(_Seq2VecWrapper(torch.nn.RNN))
 Seq2VecEncoder.register("augmented_lstm")(_Seq2VecWrapper(AugmentedLstm))
 Seq2VecEncoder.register("alternating_lstm")(_Seq2VecWrapper(StackedAlternatingLstm))
+Seq2VecEncoder.register("stacked_bidirectional_lstm")(_Seq2VecWrapper(StackedBidirectionalLstm))

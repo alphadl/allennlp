@@ -1,4 +1,5 @@
 import codecs
+import pickle
 import gzip
 import zipfile
 from copy import deepcopy
@@ -28,6 +29,19 @@ class TestVocabulary(AllenNlpTestCase):
         self.instance = Instance({"text": text_field})
         self.dataset = Batch([self.instance])
         super(TestVocabulary, self).setUp()
+
+    def test_pickling(self):
+        vocab = Vocabulary.from_instances(self.dataset)
+
+        pickled = pickle.dumps(vocab)
+        unpickled = pickle.loads(pickled)
+
+        assert dict(unpickled._index_to_token) == dict(vocab._index_to_token)
+        assert dict(unpickled._token_to_index) == dict(vocab._token_to_index)
+        assert unpickled._non_padded_namespaces == vocab._non_padded_namespaces
+        assert unpickled._oov_token == vocab._oov_token
+        assert unpickled._padding_token == vocab._padding_token
+        assert unpickled._retained_counter == vocab._retained_counter
 
     def test_from_dataset_respects_max_vocab_size_single_int(self):
         max_vocab_size = 1
@@ -219,11 +233,8 @@ class TestVocabulary(AllenNlpTestCase):
         vocab_dir = self.TEST_DIR / 'vocab_save'
 
         vocab = Vocabulary(non_padded_namespaces=["a", "c"])
-        vocab.add_token_to_namespace("a0", namespace="a")  # non-padded, should start at 0
-        vocab.add_token_to_namespace("a1", namespace="a")
-        vocab.add_token_to_namespace("a2", namespace="a")
-        vocab.add_token_to_namespace("b2", namespace="b")  # padded, should start at 2
-        vocab.add_token_to_namespace("b3", namespace="b")
+        vocab.add_tokens_to_namespace(["a0", "a1", "a2"], namespace="a")  # non-padded, should start at 0
+        vocab.add_tokens_to_namespace(["b2", "b3"], namespace="b")  # padded, should start at 2
 
         vocab.save_to_files(vocab_dir)
         vocab2 = Vocabulary.from_files(vocab_dir)
@@ -259,7 +270,8 @@ class TestVocabulary(AllenNlpTestCase):
         # vocab, load the vocab, then index the text field again, and make sure we get the same
         # result.
         tokenizer = CharacterTokenizer(byte_encoding='utf-8')
-        token_indexer = TokenCharactersIndexer(character_tokenizer=tokenizer)
+        token_indexer = TokenCharactersIndexer(character_tokenizer=tokenizer,
+                                               min_padding_length=2)
         tokens = [Token(t) for t in ["Øyvind", "für", "汉字"]]
         text_field = TextField(tokens, {"characters": token_indexer})
         dataset = Batch([Instance({"sentence": text_field})])
@@ -279,11 +291,8 @@ class TestVocabulary(AllenNlpTestCase):
         # Save a vocab to check we can load it from_params.
         vocab_dir = self.TEST_DIR / 'vocab_save'
         vocab = Vocabulary(non_padded_namespaces=["a", "c"])
-        vocab.add_token_to_namespace("a0", namespace="a")  # non-padded, should start at 0
-        vocab.add_token_to_namespace("a1", namespace="a")
-        vocab.add_token_to_namespace("a2", namespace="a")
-        vocab.add_token_to_namespace("b2", namespace="b")  # padded, should start at 2
-        vocab.add_token_to_namespace("b3", namespace="b")
+        vocab.add_tokens_to_namespace(["a0", "a1", "a2"], namespace="a")  # non-padded, should start at 0
+        vocab.add_tokens_to_namespace(["b2", "b3"], namespace="b")  # padded, should start at 2
         vocab.save_to_files(vocab_dir)
 
         params = Params({"directory_path": vocab_dir})
@@ -319,9 +328,7 @@ class TestVocabulary(AllenNlpTestCase):
         non_padded_namespaces_list = [[], ["tokens"]]
         for non_padded_namespaces in non_padded_namespaces_list:
             original_vocab = Vocabulary(non_padded_namespaces=non_padded_namespaces)
-            original_vocab.add_token_to_namespace("d", namespace="tokens")
-            original_vocab.add_token_to_namespace("a", namespace="tokens")
-            original_vocab.add_token_to_namespace("b", namespace="tokens")
+            original_vocab.add_tokens_to_namespace(["d", "a", "b"], namespace="tokens")
             text_field = TextField([Token(t) for t in ["a", "d", "c", "e"]],
                                    {"tokens": SingleIdTokenIndexer("tokens")})
             instances = Batch([Instance({"text": text_field})])
@@ -382,8 +389,7 @@ class TestVocabulary(AllenNlpTestCase):
     def test_invalid_vocab_extension(self):
         vocab_dir = self.TEST_DIR / 'vocab_save'
         original_vocab = Vocabulary(non_padded_namespaces=["tokens1"])
-        original_vocab.add_token_to_namespace("a", namespace="tokens1")
-        original_vocab.add_token_to_namespace("b", namespace="tokens1")
+        original_vocab.add_tokens_to_namespace(["a", "b"], namespace="tokens1")
         original_vocab.add_token_to_namespace("p", namespace="tokens2")
         original_vocab.save_to_files(vocab_dir)
         text_field1 = TextField([Token(t) for t in ["a" "c"]],
@@ -455,7 +461,7 @@ class TestVocabulary(AllenNlpTestCase):
             _ = Vocabulary.from_params(params, instances)
 
     def test_from_params_valid_vocab_extension_thoroughly(self):
-        '''
+        """
         Tests for Valid Vocab Extension thoroughly: Vocab extension is valid
         when overlapping namespaces have same padding behaviour (padded/non-padded)
         Summary of namespace paddings in this test:
@@ -482,7 +488,7 @@ class TestVocabulary(AllenNlpTestCase):
            an              #3->an
            atom            #4->atom
            banana          #5->banana
-        '''
+        """
 
         vocab_dir = self.TEST_DIR / 'vocab_save'
         original_vocab = Vocabulary(non_padded_namespaces=["tokens1", "tokens3"])
@@ -576,11 +582,8 @@ class TestVocabulary(AllenNlpTestCase):
 
     def test_vocab_can_print(self):
         vocab = Vocabulary(non_padded_namespaces=["a", "c"])
-        vocab.add_token_to_namespace("a0", namespace="a")
-        vocab.add_token_to_namespace("a1", namespace="a")
-        vocab.add_token_to_namespace("a2", namespace="a")
-        vocab.add_token_to_namespace("b2", namespace="b")
-        vocab.add_token_to_namespace("b3", namespace="b")
+        vocab.add_tokens_to_namespace(["a0", "a1", "a2"], namespace="a")
+        vocab.add_tokens_to_namespace(["b2", "b3"], namespace="b")
         print(vocab)
 
     def test_read_pretrained_words(self):
@@ -592,7 +595,7 @@ class TestVocabulary(AllenNlpTestCase):
         base_path = str(self.FIXTURES_ROOT / "embeddings/fake_embeddings.5d.txt")
         for ext in ['', '.gz', '.lzma', '.bz2', '.zip', '.tar.gz']:
             file_path = base_path + ext
-            words_read = _read_pretrained_tokens(file_path)
+            words_read = set(_read_pretrained_tokens(file_path))
             assert words_read == words, f"Wrong words for file {file_path}\n" \
                                         f"   Read: {sorted(words_read)}\n" \
                                         f"Correct: {sorted(words)}"
@@ -603,7 +606,7 @@ class TestVocabulary(AllenNlpTestCase):
         for ext in ['.zip', '.tar.gz']:
             archive_path = base_path + ext
             embeddings_file_uri = format_embeddings_file_uri(archive_path, file_path)
-            words_read = _read_pretrained_tokens(embeddings_file_uri)
+            words_read = set(_read_pretrained_tokens(embeddings_file_uri))
             assert words_read == words, f"Wrong words for file {archive_path}\n" \
                                         f"   Read: {sorted(words_read)}\n" \
                                         f"Correct: {sorted(words)}"
@@ -671,3 +674,32 @@ class TestVocabulary(AllenNlpTestCase):
         words = vocab.get_index_to_token_vocabulary().values()
         # Additional 2 tokens are '@@PADDING@@' and '@@UNKNOWN@@' by default
         assert len(words) == 3
+
+    def test_max_vocab_size_partial_dict(self):
+        indexers = {"tokens": SingleIdTokenIndexer(),
+                    "token_characters": TokenCharactersIndexer(min_padding_length=3)}
+        instance = Instance({
+                'text': TextField([Token(w) for w in 'Abc def ghi jkl mno pqr stu vwx yz'.split(' ')], indexers)
+        })
+        dataset = Batch([instance])
+        params = Params({
+                "max_vocab_size": {
+                        "tokens": 1
+                }
+        })
+
+        vocab = Vocabulary.from_params(params=params, instances=dataset)
+        assert len(vocab.get_index_to_token_vocabulary("tokens").values()) == 3 # 1 + 2
+        assert len(vocab.get_index_to_token_vocabulary("token_characters").values()) == 28 # 26 + 2
+
+    def test_min_pretrained_embeddings(self):
+        params = Params({
+                "pretrained_files": {
+                        "tokens": str(self.FIXTURES_ROOT / "embeddings/glove.6B.100d.sample.txt.gz")
+                },
+                "min_pretrained_embeddings": {"tokens": 50},
+        })
+
+        vocab = Vocabulary.from_params(params=params, instances=self.dataset)
+        assert vocab.get_vocab_size() >= 50
+        assert vocab.get_token_index("his") > 1  # not @@UNKNOWN@@

@@ -37,6 +37,7 @@ class CharacterTokenizer(Tokenizer):
                  lowercase_characters: bool = False,
                  start_tokens: List[str] = None,
                  end_tokens: List[str] = None) -> None:
+        # TODO(brendanr): Add length truncation.
         self._byte_encoding = byte_encoding
         self._lowercase_characters = lowercase_characters
         self._start_tokens = start_tokens or []
@@ -72,3 +73,8 @@ class CharacterTokenizer(Tokenizer):
                 token = Token(text=end_token, idx=0)
             tokens.append(token)
         return tokens
+
+    def __eq__(self, other) -> bool:
+        if isinstance(self, other.__class__):
+            return self.__dict__ == other.__dict__
+        return NotImplemented
